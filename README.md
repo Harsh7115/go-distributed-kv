@@ -125,3 +125,5 @@ On a 3-node cluster (local loopback, M1 MacBook):
 ## License
 
 MIT
+
+<!-- Last reviewed: March 2026 -->
