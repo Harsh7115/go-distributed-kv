@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"os"
@@ -8,47 +9,47 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/Harsh7115/go-distributed-kv/internal/app"
 	"go.uber.org/zap"
 )
 
 func main() {
-	id      := flag.Uint64("id", 1, "node ID (must be unique in cluster)")
-	httpAddr := flag.String("http", ":8080", "HTTP API listen address")
-	raftAddr := flag.String("raft", ":9090", "Raft gRPC listen address")
-	peers    := flag.String("peers", "", "comma-separated list of peer raft addresses")
-	dataDir  := flag.String("data", "./data", "directory for persistent Raft log storage")
+	id       := flag.Uint64("id",    1,        "node ID (unique within the cluster)")
+	httpAddr := flag.String("http",  ":8080",  "HTTP API listen address")
+	raftAddr := flag.String("raft",  ":9090",  "Raft RPC listen address")
+	peers    := flag.String("peers", "",       `comma-separated peer list: "id=host:port,id=host:port"`)
+	dataDir  := flag.String("data",  "./data", "directory for persistent Raft log storage")
 	flag.Parse()
 
 	logger, err := zap.NewProduction()
 	if err != nil {
-		log.Fatalf("failed to init logger: %v", err)
+		log.Fatalf("logger: %v", err)
 	}
-	defer logger.Sync()
+	defer logger.Sync() //nolint:errcheck
 
 	var peerList []string
 	if *peers != "" {
 		peerList = strings.Split(*peers, ",")
 	}
 
-	logger.Info("starting go-distributed-kv node",
-		zap.Uint64("id", *id),
-		zap.String("http", *httpAddr),
-		zap.String("raft", *raftAddr),
-		zap.Strings("peers", peerList),
-		zap.String("dataDir", *dataDir),
-	)
-
-	if err := os.MkdirAll(*dataDir, 0755); err != nil {
-		logger.Fatal("failed to create data dir", zap.Error(err))
+	cfg := app.Config{
+		NodeID:   *id,
+		HTTPAddr: *httpAddr,
+		RaftAddr: *raftAddr,
+		Peers:    peerList,
+		DataDir:  *dataDir,
 	}
 
-	// TODO: wire up raft.Node, store.KVStore, and server.Server here.
-	// Keeping main lean — construction happens in an internal/app package.
-	logger.Info("node ready", zap.String("http", *httpAddr))
+	node, err := app.New(cfg, logger)
+	if err != nil {
+		logger.Fatal("failed to initialise node", zap.Error(err))
+	}
 
-	// Block until SIGINT / SIGTERM
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-	logger.Info("shutting down gracefully")
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if err := node.Run(ctx); err != nil {
+		logger.Error("node exited with error", zap.Error(err))
+		os.Exit(1)
+	}
 }
