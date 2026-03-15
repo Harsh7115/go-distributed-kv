@@ -6,6 +6,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -19,8 +20,8 @@ import (
 // Config holds all tunables surfaced by the CLI flags.
 type Config struct {
 	NodeID   uint64
-	HTTPAddr string   // address for the client-facing HTTP API
-	RaftAddr string   // address this node advertises for Raft RPC
+	HTTPAddr string // address for the client-facing HTTP API
+	RaftAddr string // address this node listens on for Raft RPC
 	Peers    []string // "id=host:port" entries for every *other* node
 	DataDir  string
 }
@@ -42,14 +43,15 @@ func ParsePeers(raw []string) (ids []uint64, addrs []string, err error) {
 	return
 }
 
-// App is the fully-wired node: transport + Raft + KV store + HTTP API.
+// App is the fully-wired node: transport + Raft + KV store + HTTP API + Raft RPC server.
 type App struct {
-	cfg    Config
-	node   *raft.Node
-	kv     *store.KVStore
-	srv    *server.Server
-	trans  *raft.HTTPTransport
-	logger *zap.Logger
+	cfg     Config
+	node    *raft.Node
+	kv      *store.KVStore
+	srv     *server.Server  // client-facing KV API
+	raftSrv *http.Server    // internal Raft RPC server
+	trans   *raft.HTTPTransport
+	logger  *zap.Logger
 }
 
 // New constructs the App from cfg without starting any goroutines.
@@ -65,10 +67,10 @@ func New(cfg Config, logger *zap.Logger) (*App, error) {
 	// applyCh is the bridge between Raft commits and the KV state machine.
 	// A buffer of 256 avoids blocking the commit path under burst load.
 	applyCh := make(chan []byte, 256)
-
 	kv := store.New(applyCh)
 
 	trans := raft.NewHTTPTransport(5 * time.Second)
+
 	nodeCfg := raft.Config{
 		ID:             cfg.NodeID,
 		Peers:          allIDs,
@@ -80,21 +82,33 @@ func New(cfg Config, logger *zap.Logger) (*App, error) {
 	node := raft.NewNode(nodeCfg, trans, logger)
 	node.SetApplyCh(applyCh)
 
+	// Wire the Raft RPC HTTP server (receives AppendEntries / RequestVote).
+	raftMux := http.NewServeMux()
+	raft.NewRaftHandler(node).Register(raftMux)
+	raftSrv := &http.Server{
+		Addr:         cfg.RaftAddr,
+		Handler:      raftMux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 5 * time.Second,
+	}
+
 	srv := server.New(cfg.HTTPAddr, kv, node.Propose, logger)
 
 	return &App{
-		cfg:    cfg,
-		node:   node,
-		kv:     kv,
-		srv:    srv,
-		trans:  trans,
-		logger: logger,
+		cfg:     cfg,
+		node:    node,
+		kv:      kv,
+		srv:     srv,
+		raftSrv: raftSrv,
+		trans:   trans,
+		logger:  logger,
 	}, nil
 }
 
 // Run starts all background goroutines and blocks until ctx is cancelled or
-// the HTTP server exits with an error.
+// one of the HTTP servers exits with an error.
 func (a *App) Run(ctx context.Context) error {
+	// Logical clock: drives heartbeats and election timeouts.
 	go func() {
 		t := time.NewTicker(10 * time.Millisecond)
 		defer t.Stop()
@@ -108,6 +122,11 @@ func (a *App) Run(ctx context.Context) error {
 		}
 	}()
 
+	// Start the internal Raft RPC server.
+	raftErr := make(chan error, 1)
+	go func() { raftErr <- a.raftSrv.ListenAndServe() }()
+
+	// Start the client-facing KV API server.
 	srvErr := make(chan error, 1)
 	go func() { srvErr <- a.srv.Start() }()
 
@@ -120,9 +139,10 @@ func (a *App) Run(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 	case err := <-srvErr:
-		return fmt.Errorf("HTTP server: %w", err)
+		return fmt.Errorf("KV HTTP server: %w", err)
+	case err := <-raftErr:
+		return fmt.Errorf("Raft RPC server: %w", err)
 	}
-
 	return a.shutdown()
 }
 
@@ -130,8 +150,12 @@ func (a *App) shutdown() error {
 	a.logger.Info("shutting down gracefully")
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+
 	if err := a.srv.Shutdown(shutCtx); err != nil {
-		a.logger.Warn("HTTP server shutdown", zap.Error(err))
+		a.logger.Warn("KV HTTP server shutdown", zap.Error(err))
+	}
+	if err := a.raftSrv.Shutdown(shutCtx); err != nil {
+		a.logger.Warn("Raft RPC server shutdown", zap.Error(err))
 	}
 	a.kv.Stop()
 	_ = a.trans.Close()
