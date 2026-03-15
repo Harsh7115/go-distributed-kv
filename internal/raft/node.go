@@ -73,6 +73,10 @@ type Node struct {
 
 	votes map[uint64]bool
 
+	// applyCh receives the raw command bytes of every newly committed entry.
+	// Set via SetApplyCh; nil means no delivery (useful in tests).
+	applyCh chan<- []byte
+
 	transport Transport
 	logger    *zap.Logger
 	config    Config
@@ -105,6 +109,14 @@ func (n *Node) Term() uint64 {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return n.term
+}
+
+// SetApplyCh registers a channel that will receive the Command bytes of each
+// committed log entry in order. Must be called before the first Tick.
+func (n *Node) SetApplyCh(ch chan<- []byte) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.applyCh = ch
 }
 
 // Tick advances the internal logical clock by one tick.
@@ -265,6 +277,14 @@ func (n *Node) maybeCommit() {
 		if count >= quorum && n.log[idx-1].Term == n.term {
 			n.commitIndex = idx
 			n.logger.Info("committed entry", zap.Uint64("index", idx))
+			// Deliver the committed command to the KV state machine (non-blocking).
+			if n.applyCh != nil {
+				select {
+				case n.applyCh <- n.log[idx-1].Command:
+				default:
+					n.logger.Warn("applyCh full; dropping commit", zap.Uint64("index", idx))
+				}
+			}
 		}
 	}
 }
